@@ -1,0 +1,32 @@
+---
+- name: Audit Nginx TLS Certificate Expiries
+  hosts: targets
+  gather_facts: false 
+
+  tasks:
+    # 1. Fetch live cert details securely via the Control node
+    - name: Get live TLS certificate details from port 443
+      community.crypto.get_certificate:
+        host: "{{ ansible_host }}"
+        port: 443
+      register: cert_details
+      delegate_to: localhost
+      become: false
+
+    # 2. Math block: Parse ASN.1 date string and compare against current execution time
+    - name: Calculate days remaining until expiry
+      ansible.builtin.set_fact:
+        days_remaining: "{{ ((cert_details.not_after | to_datetime('%Y%m%d%H%M%SZ')) - now(utc=true)).total_seconds() / 86400 }}"
+
+    # 3. Print evaluation statement
+    - name: Display Certificate Expiration Metadata
+      ansible.builtin.debug:
+        msg: "The TLS cert for {{ ansible_host }} expires on {{ cert_details.not_after }}. Only {{ days_remaining | int }} days left!"
+
+    # 4. Enforce security threshold
+    - name: Check if certificate expires within safety threshold (30 Days)
+      ansible.builtin.assert:
+        that:
+          - days_remaining | float > 30
+        fail_msg: "ALERT: The TLS certificate for {{ ansible_host }} has less than 30 days remaining!"
+        success_msg: "SUCCESS: Certificate is healthy. {{ days_remaining | int }} days remaining."

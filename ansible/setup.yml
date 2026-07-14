@@ -1,0 +1,120 @@
+---
+- name: Deploy Secure TLS Web Servers (Local Crypto Generation)
+  hosts: targets
+  become: true
+
+  tasks:
+    # 1. Install Nginx on targets (Standard package, no extra python modules needed)
+    - name: Install Nginx web server
+      ansible.builtin.dnf:
+        name: nginx
+        state: present
+
+    # 2. Create the target directories
+    - name: Ensure target configuration and SSL directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+      loop:
+        - /etc/nginx/ssl
+        - /etc/nginx/conf.d
+
+    # =========================================================================
+    # LOCAL GENERATION BLOCK (Runs entirely on Control Server via delegate_to)
+    # =========================================================================
+
+    - name: Create local temporary workspace for crypto generation
+      ansible.builtin.file:
+        path: "/tmp/ansible_crypto_{{ inventory_hostname }}"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      become: false # Runs as ec2-user on the control node
+
+    - name: Generate an OpenSSL private key locally
+      community.crypto.openssl_privatekey:
+        path: "/tmp/ansible_crypto_{{ inventory_hostname }}/server.key"
+        size: 4096
+        type: RSA
+      delegate_to: localhost
+      become: false
+
+    - name: Generate an OpenSSL Certificate Signing Request locally
+      community.crypto.openssl_csr:
+        path: "/tmp/ansible_crypto_{{ inventory_hostname }}/server.csr"
+        privatekey_path: "/tmp/ansible_crypto_{{ inventory_hostname }}/server.key"
+        common_name: "{{ ansible_host }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Generate a Self-Signed OpenSSL certificate locally
+      community.crypto.x509_certificate:
+        path: "/tmp/ansible_crypto_{{ inventory_hostname }}/server.crt"
+        privatekey_path: "/tmp/ansible_crypto_{{ inventory_hostname }}/server.key"
+        csr_path: "/tmp/ansible_crypto_{{ inventory_hostname }}/server.csr"
+        provider: selfsigned
+      delegate_to: localhost
+      become: false
+
+    # =========================================================================
+    # DEPLOYMENT BLOCK (Pushes files from Control Server to Targets)
+    # =========================================================================
+
+    - name: Copy Private Key to Target Server
+      ansible.builtin.copy:
+        src: "/tmp/ansible_crypto_{{ inventory_hostname }}/server.key"
+        dest: /etc/nginx/ssl/server.key
+        mode: '0600'
+        owner: root
+        group: root
+
+    - name: Copy Certificate to Target Server
+      ansible.builtin.copy:
+        src: "/tmp/ansible_crypto_{{ inventory_hostname }}/server.crt"
+        dest: /etc/nginx/ssl/server.crt
+        mode: '0644'
+        owner: root
+        group: root
+
+    # 3. Clean up the control server's temporary files
+    - name: Remove local temporary workspace
+      ansible.builtin.file:
+        path: "/tmp/ansible_crypto_{{ inventory_hostname }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+
+    # 4. Configure and start Nginx on targets
+    - name: Deploy Nginx TLS configuration file
+      ansible.builtin.copy:
+        dest: /etc/nginx/conf.d/tls.conf
+        content: |
+          server {
+              listen 443 ssl;
+              server_name _;
+
+              ssl_certificate /etc/nginx/ssl/server.crt;
+              ssl_certificate_key /etc/nginx/ssl/server.key;
+
+              location / {
+                  root /usr/share/nginx/html;
+                  index index.html;
+              }
+          }
+        mode: '0644'
+      notify: Restart Nginx
+
+    - name: Ensure Nginx is running and enabled
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Restart Nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
